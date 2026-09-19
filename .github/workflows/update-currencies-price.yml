@@ -1,0 +1,245 @@
+# 💰 Update Currencies Price API
+
+name: 💰 Update Currencies Price API
+
+on:
+  schedule:
+    - cron: '15,35,55 * * * *'
+
+  # Manual execution
+  workflow_dispatch:
+
+  # Run automatically after every push to main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: currency-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ========================================
+      # Checkout
+      # ========================================
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ========================================
+      # Setup Node.js
+      # ========================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      # ========================================
+      # Install dependencies
+      # ========================================
+      - name: Install dependencies
+        run: |
+          echo "========================================"
+          echo "Installing dependencies..."
+          echo "========================================"
+
+          if [ ! -f package.json ]; then
+            echo "No package.json found — skipping npm install (script uses only built-in modules)."
+            exit 0
+          fi
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      # ========================================
+      # Scrape currencies price
+      # ========================================
+      - name: Scrape currencies price
+        run: |
+          echo "========================================"
+          echo "Scraping Alanchand currencies price..."
+          echo "========================================"
+
+          node scripts/scrape-currencies-price.js
+
+      # ========================================
+      # Validate currencies.json
+      # ========================================
+      - name: Validate currencies.json
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Validating currencies.json..."
+          echo "========================================"
+
+          if [ ! -f public/currencies.json ]; then
+            echo "ERROR: currencies.json was not created."
+            exit 1
+          fi
+
+          echo ""
+          echo "Checking JSON syntax..."
+
+          jq empty public/currencies.json
+
+          echo "JSON syntax: OK"
+
+          echo ""
+          echo "Checking currencies array..."
+
+          CURRENCY_TYPE=$(jq -r '.currencies | type' public/currencies.json)
+
+          if [ "$CURRENCY_TYPE" != "array" ]; then
+            echo "ERROR: currencies is not an array."
+            exit 1
+          fi
+
+          CURRENCY_COUNT=$(jq '.currencies | length' public/currencies.json)
+
+          echo "Currencies found: $CURRENCY_COUNT"
+
+          if [ "$CURRENCY_COUNT" -eq 0 ]; then
+            echo ""
+            echo "ERROR: No currencies found."
+            echo "Deployment cancelled."
+            exit 1
+          fi
+
+          echo ""
+          echo "Checking update_date..."
+
+          UPDATE_DATE=$(jq -r '.update_date' public/currencies.json)
+
+          if [ -z "$UPDATE_DATE" ] || [ "$UPDATE_DATE" = "null" ]; then
+            echo "ERROR: update_date is missing."
+            exit 1
+          fi
+
+          echo "Update date: $UPDATE_DATE"
+
+          echo ""
+          echo "Checking currency prices..."
+
+          INVALID_PRICES=$(jq '
+            [
+              .currencies[]
+              | select(
+                  (.price | type) != "number"
+                  or .price <= 0
+                )
+            ]
+            | length
+          ' public/currencies.json)
+
+          if [ "$INVALID_PRICES" -ne 0 ]; then
+            echo "ERROR: Invalid currency prices detected."
+            exit 1
+          fi
+
+          echo "Currency prices: OK"
+
+          echo ""
+          echo "Checking priceChange values..."
+
+          INVALID_PRICE_CHANGE=$(jq '
+            [
+              .currencies[]
+              | select(
+                  (.priceChange | type) != "string"
+                  or (.priceChange | IN("up", "down", "no_change") | not)
+                )
+            ]
+            | length
+          ' public/currencies.json)
+
+          if [ "$INVALID_PRICE_CHANGE" -ne 0 ]; then
+            echo "ERROR: Invalid priceChange values detected."
+            exit 1
+          fi
+
+          echo "priceChange values: OK"
+
+          echo ""
+          echo "========================================"
+          echo "JSON validation successful."
+          echo "========================================"
+
+          echo ""
+          echo "Generated JSON:"
+
+          jq '.' public/currencies.json
+
+      # ========================================
+      # Generate GitHub Pages site
+      # ========================================
+      - name: Generate site
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Generating GitHub Pages..."
+          echo "========================================"
+
+          rm -rf _site
+          mkdir -p _site
+
+          echo "Copying currencies.json..."
+
+          cp public/currencies.json _site/currencies.json
+
+          if [ -f index.html ]; then
+            echo "Copying index.html..."
+            cp index.html _site/index.html
+          else
+            echo "ERROR: index.html not found."
+            exit 1
+          fi
+
+          echo ""
+          echo "Files that will be deployed:"
+
+          ls -lah _site
+
+      # ========================================
+      # Setup GitHub Pages
+      # ========================================
+      - name: Setup Pages
+        uses: actions/configure-pages@v6
+
+      # ========================================
+      # Upload Pages artifact
+      # ========================================
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: '_site'
+
+  # ==========================================
+  # Deploy
+  # ==========================================
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 10
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
