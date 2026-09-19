@@ -1,118 +1,443 @@
-# 💰 Update Currencies Price API
 name: 💰 Update Currencies Price API
-
 on:
-  schedule:
-    - cron: '15 * * * *'
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-
+schedule:
+- cron: '15 * * * *'
+workflow_dispatch:
+push:
+branches:
+- main
 permissions:
-  contents: read
-  pages: write
-  id-token: write
-
+contents: read
+pages: write
+id-token: write
 concurrency:
-  group: pages     
-  cancel-in-progress: true     
-
+group: pages
+cancel-in-progress: true
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4 
+build:
+runs-on: ubuntu-latest
+steps:
+- name: Checkout
+uses: actions/checkout@v4
+  - name: Setup Node.js
+    uses: actions/setup-node@v4
+    with:
+      node-version: 20
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+  - name: Create scraper script
+    run: |
+      mkdir -p scripts
+      cat << 'EOF' > scripts/scrape-currencies-price.js
+      #!/usr/bin/env node
+      'use strict';
 
-      - name: Install dependencies
-        run: |
-          if [ ! -f package.json ]; then
-            echo "No package.json found — skipping npm install."
-            exit 0
-          fi
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+      const https = require('https');
+      const http = require('http');
+      const fs = require('fs');
+      const path = require('path');
+      const { URL } = require('url');
 
-      - name: Scrape currencies price
-        run: |
-          echo "Scraping Alanchand currencies price..."
-          node scripts/scrape-currencies-price.js
+      const CONFIG = {
+        sourceUrl: 'https://alanchand.com/currencies-price',
+        outputDir: path.join(process.cwd(), 'public'),
+        outputFile: 'currencies.json',
+        requestTimeoutMs: 15000,
+        maxRedirects: 5,
+        maxHtmlSizeBytes: 10 * 1024 * 1024,
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36',
+      };
 
-      - name: Validate currencies.json
-        run: |
-          set -euo pipefail
-          if [ ! -f public/currencies.json ]; then
-            echo "ERROR: currencies.json was not created."
-            exit 1
-          fi
-          jq empty public/currencies.json
-          CURRENCY_TYPE=$(jq -r '.currencies | type' public/currencies.json)
-          if [ "$CURRENCY_TYPE" != "array" ]; then
-            echo "ERROR: currencies is not an array."
-            exit 1
-          fi
-          CURRENCY_COUNT=$(jq '.currencies | length' public/currencies.json)
-          echo "Currencies found: $CURRENCY_COUNT"
-          if [ "$CURRENCY_COUNT" -eq 0 ]; then
-            echo "ERROR: No currencies found."
-            exit 1
-          fi
-          UPDATE_DATE=$(jq -r '.update_date' public/currencies.json)
-          if [ -z "$UPDATE_DATE" ] || [ "$UPDATE_DATE" = "null" ]; then
-            echo "ERROR: update_date is missing."
-            exit 1
-          fi
-          INVALID_PRICES=$(jq '[.currencies[] | select((.price | type) != "number" or .price <= 0)] | length' public/currencies.json)
-          if [ "$INVALID_PRICES" -ne 0 ]; then
-            echo "ERROR: Invalid currency prices detected."
-            exit 1
-          fi
-          INVALID_PRICE_CHANGE=$(jq '[.currencies[] | select((.priceChange | type) != "string" or (.priceChange | IN("up", "down", "no_change") | not))] | length' public/currencies.json)
-          if [ "$INVALID_PRICE_CHANGE" -ne 0 ]; then
-            echo "ERROR: Invalid priceChange values detected."
-            exit 1
-          fi
-          echo "JSON validation successful."
-          jq '.' public/currencies.json
+      const PRICE_TREND = {
+        UP: 'up',
+        DOWN: 'down',
+        NO_CHANGE: 'no_change',
+      };
 
-      - name: Generate site
-        run: |
-          set -euo pipefail
-          rm -rf _site
-          mkdir -p _site
-          cp public/currencies.json _site/currencies.json
-          if [ -f index.html ]; then
-            cp index.html _site/index.html
-          else
-            echo "ERROR: index.html not found."
-            exit 1
-          fi
-          ls -lah _site
+      const VALID_PRICE_TRENDS = Object.values(PRICE_TREND);
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
+      class PersianDigitNormalizer {
+        static PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹';
+        static ARABIC_DIGITS = '٠١٢٣٤٥٦٧٨٩';
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: '_site'
+        static normalize(value) {
+          if (typeof value !== 'string') {
+            return '';
+          }
+          return value
+            .replace(/[۰-۹]/g, (digit) => String(PersianDigitNormalizer.PERSIAN_DIGITS.indexOf(digit)))
+            .replace(/[٠-٩]/g, (digit) => String(PersianDigitNormalizer.ARABIC_DIGITS.indexOf(digit)));
+        }
+      }
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      class PriceParser {
+        static parse(rawValue) {
+          if (!rawValue) {
+            return null;
+          }
+          const normalized = PersianDigitNormalizer.normalize(rawValue).trim();
+          const withoutThousandsSeparators = normalized.replace(/[,\u066C\s\u00A0]/g, '');
+          const withDotDecimal = withoutThousandsSeparators.replace(/[\u066B]/g, '.');
+
+          if (!/^\d+(\.\d+)?$/.test(withDotDecimal)) {
+            return null;
+          }
+
+          const price = Number(withDotDecimal);
+          if (!Number.isFinite(price) || price <= 0) {
+            return null;
+          }
+
+          const roundedPrice = Math.round(price);
+          if (!Number.isSafeInteger(roundedPrice)) {
+            return null;
+          }
+
+          return roundedPrice;
+        }
+      }
+
+      class HttpClient {
+        constructor({ timeoutMs, maxRedirects, userAgent, maxBodyBytes }) {
+          this.timeoutMs = timeoutMs;
+          this.maxRedirects = maxRedirects;
+          this.userAgent = userAgent;
+          this.maxBodyBytes = maxBodyBytes;
+        }
+
+        fetchText(targetUrl, redirectsLeft = this.maxRedirects) {
+          return new Promise((resolve, reject) => {
+            let parsedUrl;
+            try {
+              parsedUrl = new URL(targetUrl);
+            } catch (err) {
+              reject(new Error(`Invalid URL: ${targetUrl}`));
+              return;
+            }
+
+            const client = parsedUrl.protocol === 'http:' ? http : https;
+            const request = client.get(
+              parsedUrl,
+              {
+                headers: {
+                  'User-Agent': this.userAgent,
+                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7',
+                },
+              },
+              (response) => this._handleResponse(response, parsedUrl, redirectsLeft, resolve, reject),
+            );
+
+            request.setTimeout(this.timeoutMs, () => {
+              request.destroy(new Error(`Request timed out after ${this.timeoutMs}ms: ${targetUrl}`));
+            });
+
+            request.on('error', (err) =>
+              reject(new Error(`Network error while fetching ${targetUrl}: ${err.message}`)),
+            );
+          });
+        }
+
+        _handleResponse(response, requestUrl, redirectsLeft, resolve, reject) {
+          const { statusCode, headers } = response;
+
+          if (statusCode >= 300 && statusCode < 400 && headers.location) {
+            response.resume();
+            if (redirectsLeft <= 0) {
+              reject(new Error(`Too many redirects while fetching ${requestUrl.href}`));
+              return;
+            }
+
+            let nextUrl;
+            try {
+              nextUrl = new URL(headers.location, requestUrl).toString();
+            } catch (err) {
+              reject(new Error(`Invalid redirect location "${headers.location}" from ${requestUrl.href}`));
+              return;
+            }
+
+            this.fetchText(nextUrl, redirectsLeft - 1).then(resolve).catch(reject);
+            return;
+          }
+
+          if (statusCode !== 200) {
+            response.resume();
+            reject(new Error(`Source website returned HTTP ${statusCode} for ${requestUrl.href}`));
+            return;
+          }
+
+          let html = '';
+          let receivedBytes = 0;
+          let aborted = false;
+
+          response.setEncoding('utf8');
+
+          response.on('data', (chunk) => {
+            if (aborted) return;
+            receivedBytes += Buffer.byteLength(chunk, 'utf8');
+
+            if (receivedBytes > this.maxBodyBytes) {
+              aborted = true;
+              response.destroy();
+              reject(new Error(`Response body exceeded ${this.maxBodyBytes} byte limit`));
+              return;
+            }
+            html += chunk;
+          });
+
+          response.on('end', () => {
+            if (aborted) return;
+            resolve(html);
+          });
+
+          response.on('error', (err) => {
+            if (aborted) return;
+            reject(new Error(`Error while reading response body: ${err.message}`));
+          });
+        }
+      }
+
+      class CurrencyHtmlParser {
+        parse(html) {
+          const currencies = [];
+          const rowRegex = /<tr\b[^>]*>[\s\S]*?<\/tr>/gi;
+          const rows = html.match(rowRegex) || [];
+
+          console.log(`Table rows found: ${rows.length}`);
+
+          for (const rowHtml of rows) {
+            const currency = this._parseRow(rowHtml);
+            if (currency) {
+              currencies.push(currency);
+            }
+          }
+          return currencies;
+        }
+
+        _parseRow(rowHtml) {
+          const nameMatch = rowHtml.match(/currencies-price\/([a-z0-9-]+)['"]/i);
+          if (!nameMatch) {
+            return null;
+          }
+
+          const name = nameMatch[1].toLowerCase();
+          const sellPriceMatch = rowHtml.match(
+            /<td\b[^>]*class=["'][^"']*\bsellPrice\b[^"']*["'][^>]*>([\s\S]*?)<\/td>/i,
+          );
+
+          if (!sellPriceMatch) {
+            return null;
+          }
+
+          const cellHtml = sellPriceMatch[1];
+          const symbolMatch = cellHtml.match(
+            /class=["'][^"']*\bpriceSymbol\b[^"']*\b(up|down|no_change)\b/i,
+          );
+
+          let priceChange;
+          if (symbolMatch) {
+            priceChange = symbolMatch[1].toLowerCase();
+          } else {
+            priceChange = PRICE_TREND.NO_CHANGE;
+          }
+
+          const sellPriceText = cellHtml.replace(/<[^>]*>/g, ' ').trim();
+          const price = PriceParser.parse(sellPriceText);
+
+          if (price === null) {
+            return null;
+          }
+
+          return { name, price, priceChange };
+        }
+      }
+
+      class CurrencyValidator {
+        deduplicate(currencies) {
+          const seen = new Map();
+          for (const currency of currencies) {
+            if (!seen.has(currency.name)) {
+              seen.set(currency.name, currency);
+            }
+          }
+          return Array.from(seen.values());
+        }
+
+        validate(currencies) {
+          if (currencies.length === 0) {
+            throw new Error('No currencies were found. The page structure may have changed.');
+          }
+
+          for (const currency of currencies) {
+            if (typeof currency.name !== 'string' || currency.name.length === 0) {
+              throw new Error('Invalid currency name detected.');
+            }
+            if (!Number.isSafeInteger(currency.price) || currency.price <= 0) {
+              throw new Error(`Invalid price for currency "${currency.name}": ${currency.price}`);
+            }
+            if (!VALID_PRICE_TRENDS.includes(currency.priceChange)) {
+              throw new Error(`Invalid "priceChange" for currency "${currency.name}": ${currency.priceChange}`);
+            }
+          }
+        }
+      }
+
+      class CurrencyFileRepository {
+        constructor(outputDir, outputFileName) {
+          this.outputDir = outputDir;
+          this.outputPath = path.join(outputDir, outputFileName);
+        }
+
+        save({ updateDate, currencies }) {
+          const payload = { update_date: updateDate, currencies };
+          const json = JSON.stringify(payload, null, 2);
+
+          fs.mkdirSync(this.outputDir, { recursive: true });
+
+          const tempPath = `${this.outputPath}.tmp-${process.pid}`;
+          fs.writeFileSync(tempPath, json, 'utf8');
+          fs.renameSync(tempPath, this.outputPath);
+
+          return this.outputPath;
+        }
+      }
+
+      class CurrencyScraperService {
+        constructor({ httpClient, parser, validator, repository, sourceUrl }) {
+          this.httpClient = httpClient;
+          this.parser = parser;
+          this.validator = validator;
+          this.repository = repository;
+          this.sourceUrl = sourceUrl;
+        }
+
+        async run() {
+          console.log('Downloading website...');
+          const html = await this.httpClient.fetchText(this.sourceUrl);
+          console.log(`HTML size: ${html.length} bytes`);
+
+          const rawCurrencies = this.parser.parse(html);
+          const currencies = this.validator.deduplicate(rawCurrencies);
+
+          console.log(`Currencies found: ${currencies.length}`);
+          this.validator.validate(currencies);
+
+          const updateDate = new Date().toISOString();
+          const outputPath = this.repository.save({ updateDate, currencies });
+
+          console.log(`Output saved to: ${outputPath}`);
+        }
+      }
+
+      async function main() {
+        const httpClient = new HttpClient({
+          timeoutMs: CONFIG.requestTimeoutMs,
+          maxRedirects: CONFIG.maxRedirects,
+          userAgent: CONFIG.userAgent,
+          maxBodyBytes: CONFIG.maxHtmlSizeBytes,
+        });
+
+        const service = new CurrencyScraperService({
+          httpClient,
+          parser: new CurrencyHtmlParser(),
+          validator: new CurrencyValidator(),
+          repository: new CurrencyFileRepository(CONFIG.outputDir, CONFIG.outputFile),
+          sourceUrl: CONFIG.sourceUrl,
+        });
+
+        await service.run();
+      }
+
+      main().catch((error) => {
+        console.error('SCRAPER FAILED:', error && error.message ? error.message : error);
+        process.exit(1);
+      });
+      EOF
+
+  - name: Install dependencies
+    run: |
+      if [ ! -f package.json ]; then
+        echo "No package.json found — skipping npm install."
+        exit 0
+      fi
+      if [ -f package-lock.json ]; then
+        npm ci
+      else
+        npm install
+      fi
+
+  - name: Scrape currencies price
+    run: |
+      echo "Scraping Alanchand currencies price..."
+      node scripts/scrape-currencies-price.js
+
+  - name: Validate currencies.json
+    run: |
+      set -euo pipefail
+      if [ ! -f public/currencies.json ]; then
+        echo "ERROR: currencies.json was not created."
+        exit 1
+      fi
+      jq empty public/currencies.json
+      CURRENCY_TYPE=$(jq -r '.currencies | type' public/currencies.json)
+      if [ "$CURRENCY_TYPE" != "array" ]; then
+        echo "ERROR: currencies is not an array."
+        exit 1
+      fi
+      CURRENCY_COUNT=$(jq '.currencies | length' public/currencies.json)
+      echo "Currencies found: $CURRENCY_COUNT"
+      if [ "$CURRENCY_COUNT" -eq 0 ]; then
+        echo "ERROR: No currencies found."
+        exit 1
+      fi
+      UPDATE_DATE=$(jq -r '.update_date' public/currencies.json)
+      if [ -z "$UPDATE_DATE" ] \vert{}\vert{} [ "$UPDATE_DATE" = "null" ]; then
+        echo "ERROR: update_date is missing."
+        exit 1
+      fi
+      INVALID_PRICES=$(jq '[.currencies[] | select((.price | type) != "number" or .price <= 0)] | length' public/currencies.json)
+      if [ "$INVALID_PRICES" -ne 0 ]; then
+        echo "ERROR: Invalid currency prices detected."
+        exit 1
+      fi
+      INVALID_PRICE_CHANGE=$(jq '[.currencies[] | select((.priceChange | type) != "string" or (.priceChange | IN("up", "down", "no_change") | not))] | length' public/currencies.json)
+      if [ "$INVALID_PRICE_CHANGE" -ne 0 ]; then
+        echo "ERROR: Invalid priceChange values detected."
+        exit 1
+      fi
+      echo "JSON validation successful."
+      jq '.' public/currencies.json
+
+  - name: Generate site
+    run: |
+      set -euo pipefail
+      rm -rf _site
+      mkdir -p _site
+      cp public/currencies.json _site/currencies.json
+      if [ -f index.html ]; then
+        cp index.html _site/index.html
+      else
+        echo "ERROR: index.html not found."
+        exit 1
+      fi
+      ls -lah _site
+
+  - name: Setup Pages
+    uses: actions/configure-pages@v5
+
+  - name: Upload Pages artifact
+    uses: actions/upload-pages-artifact@v4
+    with:
+      path: '_site'
+
+
+deploy:
+runs-on: ubuntu-latest
+needs: build
+environment:
+name: github-pages
+url: ${{ steps.deployment.outputs.page_url }}
+steps:
+- name: Deploy to GitHub Pages
+id: deployment
+uses: actions/deploy-pages@v4
