@@ -3,7 +3,7 @@ name: 💰 Update Currencies Price API
 
 on:
   schedule:
-    - cron: '15 * * * *'
+    - cron: '17 * * * *'
   workflow_dispatch:
   push:
     branches:
